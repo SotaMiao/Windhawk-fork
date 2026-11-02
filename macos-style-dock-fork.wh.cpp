@@ -16,7 +16,13 @@
 # MacOS Style Dock
 
 --update 2026.11.02 by Zhanghengmiao--
+
 右下角的状态栏也添加了背景与dock共用参数
+
+--update 2026.11.02 by Zhanghengmiao--
+
+Click-through taskbar
+Make the empty parts of the taskbar click-through. Only the area with the taskbar buttons and the system tray stays visible and clickable. Mainly useful for dock themes such as DockLike.
 
 Turns the Windows 11 taskbar into a dock with the look and feel of macOS,
 while it keeps working the way Windows does. It restyles the real taskbar
@@ -149,6 +155,9 @@ his "Taskbar auto-hide when maximized" mod (all GPL-3.0).
   - recycleBin: true
     $name: Recycle Bin
     $description: Show the Recycle Bin at the right end of the dock, after a divider.
+  - clickThrough: false
+    $name: Click-through taskbar
+    $description: Make the empty parts of the taskbar click-through. Only the dock and the system tray stay clickable.
   $name: Dock Items
 */
 // ==/WindhawkModSettings==
@@ -220,6 +229,7 @@ int g_animationMs = 100;
 bool g_showTrash = true;
 bool g_appsDivider = true;
 bool g_magnifyOverWindows = true;
+bool g_clickThrough = false;
 
 // ---- Sizes derived from the settings (see ComputeSizes) ----
 float g_iconSize = 39.0f;
@@ -1736,6 +1746,8 @@ void StopFrames() {
     g_frameRunning = false;
 }
 
+void ClipTaskbars();
+
 void OnFrame() {
     auto now = std::chrono::steady_clock::now();
     float dt = std::chrono::duration<float>(now - g_lastFrame).count();
@@ -1879,6 +1891,8 @@ void OnFrame() {
         bool current = rowParent && p.row.get() == rowParent;
         ApplyPlate(p, current ? growLeft : 0, current ? total : 0);
     }
+
+    if (g_clickThrough) ClipTaskbars();  // 放大动画中底板宽度在变，区域要跟着变
 
     if (settled) StopFrames();
 }
@@ -3009,7 +3023,134 @@ int StripHeight(UINT dpi) {
     return MulDiv((int)std::ceil(height), dpi, 96);
 }
 
+// ---- Click-through taskbar ----
+// 用窗口区域把任务栏窗口裁成 Dock 底板 + 托盘，其余部分透明且可穿透点击。
+struct ClickThroughApplied { HWND hwnd; RECT dock; RECT tray; };
+std::vector<ClickThroughApplied> g_clickThroughApplied;
+
+void UpdateClickThroughRegions() {
+    using Rect = winrt::Windows::Foundation::Rect;
+    struct Target {
+        wux::XamlRoot root{nullptr};
+        Rect dock{};
+        std::optional<Rect> tray;
+    };
+
+    // 1. 每个任务栏（每个显示器一个 XamlRoot）的 Dock 和托盘矩形，单位 DIP，
+    //    相对 XAML 根。底板位置用 p.left/p.width 算，不读 ActualWidth，
+    //    因为 ApplyPlate 刚写入的宽度要下一次布局后 ActualWidth 才更新。
+    std::vector<Target> targets;
+    for (auto& p : *g_plates) {
+        auto frame = p.frame.get();
+        auto panel = p.panel.get();
+        if (!frame || !panel || !p.root || p.width <= 0 ||
+            p.root.Visibility() != wux::Visibility::Visible) {
+            continue;
+        }
+        auto xamlRoot = frame.XamlRoot();
+        auto content = xamlRoot ? xamlRoot.Content() : nullptr;
+        if (!content) continue;
+
+        auto o = panel.TransformToVisual(content).TransformPoint({0, 0});
+        float x = o.X + p.left, y = o.Y + p.top, h = g_dockHeight;
+        // 正在放大的那个 Dock：区域向上延伸到窗口顶部，放大的图标才画得出来。
+        if (g_dockExpanded && g_rowParent.get() && p.row.get() == g_rowParent.get()) {
+            h += y;
+            y = 0;
+        }
+
+        Target t;
+        t.root = xamlRoot;
+        t.dock = Rect{x, y, p.width, h};
+        for (auto& tr : *g_trayRows) {
+            auto row = tr.element.get();
+            if (!row || row.XamlRoot() != xamlRoot || row.ActualWidth() <= 0) continue;
+            t.tray = row.TransformToVisual(content).TransformBounds(
+                {0, 0, (float)row.ActualWidth(), (float)row.ActualHeight()});
+        }
+        targets.push_back(std::move(t));
+    }
+
+    // 2. 把任务栏窗口和 XamlRoot 配对：按 XAML 根的像素尺寸找最接近的。
+    std::vector<bool> used(targets.size(), false);
+    ForEachTaskbarWindow([&](HWND tb) {
+        RECT wr;
+        if (!GetWindowRect(tb, &wr)) return;
+        int winW = wr.right - wr.left, winH = wr.bottom - wr.top;
+
+        // XAML 岛窗口在顶层窗口里的偏移与客户区大小。
+        POINT org{wr.left, wr.top};
+        RECT cr{0, 0, winW, winH};
+        if (HWND bridge = FindWindowEx(tb, nullptr,
+                L"Windows.UI.Composition.DesktopWindowContentBridge", nullptr)) {
+            GetClientRect(bridge, &cr);
+            org = {0, 0};
+            ClientToScreen(bridge, &org);
+        }
+        double scale = GetDpiForWindow(tb) / 96.0;
+
+        int best = -1;
+        double bestDiff = 1e9;
+        for (size_t i = 0; i < targets.size(); i++) {
+            if (used[i]) continue;
+            auto size = targets[i].root.Size();
+            double diff = std::fabs(size.Width * scale - cr.right) +
+                          std::fabs(size.Height * scale - cr.bottom);
+            if (diff < bestDiff) { bestDiff = diff; best = (int)i; }
+        }
+        if (best < 0) return;
+        used[best] = true;
+        auto& t = targets[best];
+
+        auto toRect = [&](Rect const& r) {
+            long left = (org.x - wr.left) + std::lround(r.X * scale);
+            long top = (org.y - wr.top) + std::lround(r.Y * scale);
+            long right = left + std::lround(r.Width * scale);
+            long bottom = top + std::lround(r.Height * scale);
+            return RECT{std::clamp(left, 0L, (long)winW), std::clamp(top, 0L, (long)winH),
+                        std::clamp(right, 0L, (long)winW), std::clamp(bottom, 0L, (long)winH)};
+        };
+
+        RECT dock = toRect(t.dock);
+        RECT tray{};
+        if (t.tray) tray = toRect(*t.tray);
+
+        // 没变就不重复 SetWindowRgn（它会触发重绘）。
+        RECT box;
+        bool hasRgn = GetWindowRgnBox(tb, &box) != ERROR;
+        auto it = std::find_if(g_clickThroughApplied.begin(), g_clickThroughApplied.end(),
+                               [tb](auto const& a) { return a.hwnd == tb; });
+        if (it != g_clickThroughApplied.end() && hasRgn &&
+            EqualRect(&it->dock, &dock) && EqualRect(&it->tray, &tray)) {
+            return;
+        }
+
+        HRGN rgn = CreateRectRgnIndirect(&dock);
+        if (t.tray) {
+            if (HRGN trayRgn = CreateRectRgnIndirect(&tray)) {
+                CombineRgn(rgn, rgn, trayRgn, RGN_OR);
+                DeleteObject(trayRgn);
+            }
+        }
+        if (SetWindowRgn(tb, rgn, TRUE)) {
+            if (it == g_clickThroughApplied.end()) {
+                g_clickThroughApplied.push_back({tb, dock, tray});
+            } else {
+                it->dock = dock;
+                it->tray = tray;
+            }
+        } else {
+            DeleteObject(rgn);
+        }
+    });
+}
+
 void ClipTaskbars() {
+    if (g_clickThrough && !g_unloading) {
+        UpdateClickThroughRegions();
+        return;
+    }
+    g_clickThroughApplied.clear();
     ForEachTaskbarWindow([](HWND tb) {
         RECT window, have;
         if (!GetWindowRect(tb, &window)) return;
@@ -3478,6 +3619,7 @@ void LoadSettings() {
     g_magnifyOverWindows = Wh_GetIntSetting(L"magnification.overWindows");
     g_appsDivider = Wh_GetIntSetting(L"items.appsDivider");
     g_showTrash = Wh_GetIntSetting(L"items.recycleBin");
+    g_clickThrough = Wh_GetIntSetting(L"items.clickThrough");   // 加这一行
 
     ComputeSizes();
     Wh_Log(L"Sizes: icon %.0f (loaded at %.0f), dock %.0f, taskbar %d, button margin %.1f",
